@@ -33,14 +33,6 @@ trans_seq = t_seq()
 """ 
     Pending_trans -> transactions that need to be verified 
 """
-pending_trans = { 
-    'lock' : threading.Condition(),
-    'queue' : []
-}
-accepted_trans = {
-    'lock' : threading.Condition(),
-    'queue' : []
-}
 events = {
     'queue' : [],
     'parallel_events': [],
@@ -51,7 +43,12 @@ class Blockchain():
     def __init__(self, new_chain=[]):
         self.chain = new_chain
         self.chain_lock = threading.Condition()
-        self.init_list = init_list
+        self.init_list = ['a', 'b', 'c']
+    def dump_chain(self):
+        with self.chain_lock:
+            f = open("ledger_%d.txt" % ((int(sys.argv[1])), "wb+"))
+            pickle.dump(self.chain, f)
+            f.close()
     def calc_hash(self, index = 0):
         with chain_lock:
             prev_hash = ""
@@ -61,15 +58,17 @@ class Blockchain():
                 prev_hash = self.chain[index]['prev_hash']
             b = self.chain[index]
         return str(hashlib.sha256( str(prev_hash+str(index)+b['nonce']+str(b['tx'])).encode()).hexdigest())
-    def add(self, source, trans_li):
+    def add(self, trans_li, depth):
         with self.chain_lock:
+            if depth != len(self.chain) +1:
+                print("Tried to insert depth(%d). Current lenth is %d" % (depth, len(self.chain)))
             prev_hash = calc_hash(len(chain)-1)
             nonce = ""
             h = ""
             i = 0
             while(not (h.endswith('0') or h.endswith('1'))):
                 i+= 1
-                nonce = str(hashlib.sha256( str.encode(str(i))).hexdigest())
+                nonce = str(hashlib.sha256(str.encode(str(i))).hexdigest())
                 a = str(trans_li)
                 h = str(hashlib.sha256(str.encode(str(prev_hash)+str(len(chain))+nonce+a)).hexdigest())
             self.chain.append({
@@ -77,6 +76,7 @@ class Blockchain():
                 'nonce': i,
                 'hash': h
             })
+            self.dump_chain()
             return True 
     def get_balance(self):
         with self.chain_lock:
@@ -110,17 +110,20 @@ class Paxos:
             self.ballot = 0
             self.proc_id = int(sys.argv[1])
             self.bc = Blockchain()
-            self.timeout_cv = threading.Condition() 
             self.timed_out = False
             self.num_promises = 0
-            self.acceptTuple = None
-            self.NUM_SERVERS = 5
+            self.acceptNum = None
+            self.acceptVal= None
+            self.NUM_SERVERS = 3
             self.REPLY_COUNT = int(self.NUM_SERVERS / 2)
             self.TIMEOUT_IN_SEC = (10, 18)
             self.output_sockets = None
-            self.accepted_trans = []
-        def initialize(self, output_sockets):
+            self.my_trans = []
+            self.received_trans= []
+        def initialize(self, output_sockets, chain=[], num_servers=3):
             self.output_sockets = output_sockets
+            self.NUM_SERVERS = 5
+            self.REPLY_COUNT = int(self.NUM_SERVERS / 2)
         def get_round(self):
             with self.lock:
                 return len(self.bc.chain)
@@ -130,27 +133,53 @@ class Paxos:
                     self.ballot = max(self.ballot, other_ballot)
                 self.ballot += random.randint(1,5)
                 return self.ballot
+        def add_localtx(self, trans):
+            with self.lock:
+                self.my_trans.append(trans)
+                f = open("curr-trans_%d.txt" % (self.proc_id), "wb+")
+                trans_queue = pickle.dump(f)
+                f.close()
+        """
+            Phase 1: Leader election / Value discovery
+        """
         def wait_for_promises(self):
             with self.lock:
                 self.num_promises = 0
-                self.acceptTuple = None
+                self.acceptVal = None
+                self.acceptNum = None
                 msg = {
                     'type': 'prepare',
                     'ballot': Paxos().get_ballot(),
                     'pid': self.proc_id
                 }
                 send_message(self.output_sockets, -1, msg)
+
                 self.timed_out = False
                 threading.Thread(target=self.timeout, args=(self.round,))
                 return 
-        def check_promise_count(self):
+        def check_promise_count(self, roundNum):
             with self.lock:
                 with self.timeout_cv:
                     if self.timed_out:
                         return -1
+                    elif self.get_round() != roundNum:
+                        return -2
                     else:
                         return self.num_replies
-        def received_promise(self, source_port, otherRound, otherNum, acceptNum, acceptVal):
+        def send_promise(self, dest_port):
+            with self.lock:
+                msg={
+                    "type": "promise",
+                    "ballot": self.get_ballot()
+                }
+                if self.acceptNum != None:
+                    msg["acceptNum"] = self.acceptNum
+                    msg["acceptVal"] = self.acceptVal
+                else:
+                    msg["acceptNum"] = None
+                    msg["acceptVal"] = copy.deepcopy(self.my_trans)
+                send_message(self.output_sockets, dest_port, msg)
+        def received_promise(self, source_port, otherRound, acceptNum, acceptVal):
             with self.lock:
                 if otherRound < self.ballot:
                     self.send_resync(source_port)
@@ -158,8 +187,16 @@ class Paxos:
                 elif otherRound > self.ballot:
                     self.ask_resync(source_port)
                     return
+                if acceptNum != None:
+                    if self.acceptNum == None:
+                        self.acceptNum = acceptNum - 1
+                    if acceptNum > self.acceptNum:
+                        self.acceptNum = acceptNum
+                        self.acceptVal = acceptVal
+                else:
+                    self.received_trans.append(acceptVal)
                 self.num_promises += 1
-        def received_resync(self, other_chain):
+        def do_resync(self, other_chain):
             with self.lock:
                 if len(other_chain) > self.bc.chain:
                     self.bc.chain = Blockchain(other_chain)
@@ -170,21 +207,17 @@ class Paxos:
                     'chain': copy.deepcopy(self.bc.chain)
                 }
                 send_message(self.output_sockets, dest_port, msg)
-        def ask_resync(self, dest_port):
+        def req_resync(self, dest_port):
             with self.lock:
                 msg = {
                     'type': 'resync_request'
                 }
                 send_message(self.output_sockets, dest_port, msg)
-
-
         def timeout(self, roundNum):
             time.sleep(random(*self.TIMEOUT_IN_SEC))
             with self.lock:
-                with self.timeout_cv:
-                    if roundNum == self.round:
-                        self.timed_out = True
-                        self.timeout_cv.notify_all()
+                if roundNum == self.round:
+                    self.timed_out = True
     instance = None
     def __new__(cls): # __new__ always a classmethod
             if not Paxos.instance:
@@ -277,13 +310,11 @@ def event_loop(output_sockets):
 
                     event_type = event['data']['type']
                     print("Reading event ", event)
-                    print("\tCurrent blockchain", bc.chain)
                     print("\tCurrent eventQueue", events['queue'])
+                    print("\tCurrent eventParallelQueue", events['parallel_events'])
 
                     if event_type == "transaction":
-                        with pending_trans['lock']:
-                            tr = create_transaction(*decomp(event, ['source', 'dest', 'amt']))
-                            pending_trans['queue'].append(tr)
+                        tr = create_transaction(*decomp(event, ['source', 'dest', 'amt']))
                         bal = Paxos().bc.get_balance()
                         bal[tr['source']] -= tr['amt']
                         bal[tr['dest']] += tr['amt']
@@ -296,43 +327,59 @@ def event_loop(output_sockets):
                                     }
                                 })
                                 continue
+                        Paxos().add_localtx(tr)
                     elif event_type == "wait_prepare":
-                        Paxos().wait_for_promises(output_sockets)
-                        with events['lock']:
-                            events['parallel_events'].append({
-                                'data': {
-                                    'type': 'check_promise_count',
-                                    'tx': event['data']['tx']
-                                }
-                            })
+                        Paxos().wait_for_promises()
+                        events['parallel_events'].append({
+                            'data': {
+                                'type': 'check_promise_count',
+                                'tx': event['data']['tx']
+                            }
+                        })
                     elif event_type == "check_promise_count":
                         result = Paxos().check_promise_count()
+                        tx = event['data']['tx']
                         if result == -1:
-                            print('TIMED OUT')
+                            print('Paxos Phase 1: Timeout during leader election')
+                        elif result == -2:
+                            print('Paxos Phase 1: My ballot out of date. Will try again with new ballot')
+                            events['queue'].append({'data': { 'type': 'wait_prepare', 'tx': tx}})
                         elif result < Paxos().REPLY_COUNT:
-                            print('NOT ENOUGH REPLIES')
-                            events['parallel_events'].append({'data': {'type': 'check_promise_count'}})
+                            print('Paxos Phase 1: Waiting for enough replies. Currently have %d replies' % result)
+                            events['parallel_events'].append({'data': {'type': 'check_promise_count', 'tx': tx}})
                         else:
-                            print('SUCCESS: RECEIVED %d REPLIES' % result)
+                            print('SUCCESS Paxos Phase 1: RECEIVED %d REPLIES' % result)
+                            events['queue'].append({'data': {'type': 'wait_acceptack', 'tx': tx}})
                     elif event_type == "prepare":
                         reply_dest = event['source']
-                        Paxos().send_promise(output_sockets, reply_dest)
+                        received_ballot = event['data']['ballot']
+                        my_ballot = Paxos().get_ballot()
+                        if received_ballot < my_ballot:
+                            Paxos().send_resync(reply_dest)
+                        elif received_ballot > my_ballot:
+                            Paxos().ask_resync(reply_dest)
+                        else:
+                            Paxos().send_promise(output_sockets, reply_dest)
                     elif event_type == "promise":
-                        Paxos().receive_promise(*decomp(event['data'],['ballot', 'acceptTuple']))
+                        Paxos().receive_promise(*decomp(event['data'],['ballot', 'acceptNum', 'acceptVal']))
                     elif event_type == "accept":
                         reply_dest = event['source']
                         Paxos().send_acceptack(output_sockets, reply_dest)
                     elif event_type == "wait_acceptack":
+                        print(event_type, 'STUB: here')
+                        continue
                     elif event_type == "check_acceptack_count":
+                        continue
                     elif event_type == "accept_ack":
-                        Paxos().
+                        continue
                     elif event_type == "decide":
                         received_value = event['data']['block']
                         Paxos().decide(received_value)
                     elif event_type == "resync":
                         received_chain = event['data']['chain']
-                        Paxos().resync(received_chain)
-
+                        Paxos().do_resync(received_chain)
+                    elif event_type == "resync_request":
+                        Paxos().send_resync(event['source'])
 
                     if event_i == len(randomSample) - 1:
                         events['queue'].pop(0)
