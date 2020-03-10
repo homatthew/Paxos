@@ -10,7 +10,10 @@ import os
 import pprint
 import copy
 import traceback
+import hashlib
 import random
+from struct import pack, unpack
+
 
 
 client_list = [3001,3002,3003]
@@ -45,27 +48,29 @@ class Blockchain():
         self.init_list = ['a', 'b', 'c']
     def dump_chain(self):
         with self.chain_lock:
-            f = open("ledger_%d.txt" % ((int(sys.argv[1])), "wb+"))
+            f = open("ledger_%d.txt" % (int(sys.argv[1])), "wb+")
             pickle.dump(self.chain, f)
             f.close()
     def calc_hash(self, index = 0):
-        with chain_lock:
+        with self.chain_lock:
             prev_hash = ""
             if(index == -1):
                 prev_hash = "NULL"
+                return prev_hash
             else:
                 prev_hash = self.chain[index]['prev_hash']
             b = self.chain[index]
-        return str(hashlib.sha256( str(prev_hash+str(index)+b['nonce']+str(b['tx'])).encode()).hexdigest())
+        return str(hashlib.sha256(str(prev_hash+str(index)+b['nonce']+str(b['tx'])).encode()).hexdigest())
     def add(self, block, depth):
         with self.chain_lock:
-            if depth != len(self.chain) +1:
-                print("Tried to insert depth(%d). Current lenth is %d" % (depth, len(self.chain)))
+            if depth != len(self.chain):
+                print("Ignoring add. Tried to insert depth(%d). Current lenth is %d" % (depth, len(self.chain)))
+                return False
             self.chain.append(block)
             self.dump_chain()
             return True 
     def create_block(self,trans_li, depth):
-        prev_hash = calc_hash(len(chain)-1)
+        prev_hash = self.calc_hash(depth-1)
         nonce = ""
         h = ""
         i = 0
@@ -73,11 +78,12 @@ class Blockchain():
             i+= 1
             nonce = str(hashlib.sha256(str.encode(str(i))).hexdigest())
             a = str(trans_li)
-            h = str(hashlib.sha256(str.encode(str(prev_hash)+str(len(chain))+nonce+a)).hexdigest())
+            h = str(hashlib.sha256(str.encode(str(prev_hash)+str(depth)+str(nonce)+a)).hexdigest())
         block = {
-            'tx' : trans_li.deepcopy(),
-            'nonce': i,
-            'hash': h
+            'depth': depth,
+            'tx' : copy.deepcopy(trans_li),
+            'nonce': nonce,
+            'prev_hash': prev_hash
         }
         return block
     def get_balance(self):
@@ -85,10 +91,22 @@ class Blockchain():
             balances = defaultdict(lambda: 10)
             for item in self.init_list:
                 balances[item] = 10
-            for transaction in self.chain:
-                balances[transaction['source']] -= transaction['amt']
-                balances[transaction['dest']] += transaction['amt']
+            for block in self.chain:
+                for transaction in block['tx']:
+                    balances[transaction['source']] -= transaction['amt']
+                    balances[transaction['dest']] += transaction['amt']
             return dict(balances)
+    def validate(self):
+        with self.chain_lock:
+            for i, e in enumerate(self.chain):
+                if self.calc_hash(i-1) != self.chain[i]['prev_hash']:
+                    pprint.pprint(self.chain[i])
+                    return False
+                cur = self.calc_hash(i)
+                if not (cur.endswith('0') or cur.endswith('1')):
+                    # print("her", i, cur)
+                    return False
+            return True
 
 def create_transaction(source, dest, amt):
     global trans_seq
@@ -113,21 +131,25 @@ class Paxos:
             self.ballot = (0, self.proc_id)
             self.bc = Blockchain()
             self.timed_out = False
+            self.timeout_phase = 1
             self.num_promises = 0
             self.acceptNum = None
             self.acceptVal= None
+            self.num_acceptack = 0
             self.NUM_SERVERS = 3
             self.REPLY_COUNT = int(self.NUM_SERVERS / 2)
             self.TIMEOUT_IN_SEC = (5,10)
             self.output_sockets = None
             self.my_trans = []
             self.received_trans= []
-        def initialize(self, output_sockets, chain=[], my_trans=[],num_servers=3):
+            self.name =  None
+        def initialize(self, output_sockets, chain=[], my_trans=[],num_servers=3, name=None):
             self.output_sockets = output_sockets
             self.my_trans = my_trans if my_trans != None else []
             self.bc = Blockchain(chain) if chain != None else Blockchain()
             self.NUM_SERVERS = num_servers
             self.REPLY_COUNT = int(self.NUM_SERVERS / 2)
+            self.name= name
         def get_round(self):
             with self.lock:
                 return len(self.bc.chain)
@@ -168,15 +190,16 @@ class Paxos:
                 self.acceptNum = None
                 self.received_trans= []
                 roundNum = Paxos().get_round()
+                bal = Paxos().get_new_ballot()
                 msg = {
                     'type': 'prepare',
-                    'ballot': Paxos().get_new_ballot(),
+                    'ballot': bal,
                     'roundNum': roundNum,
                 }
                 send_message(self.output_sockets, -1, msg)
 
-                threading.Thread(target=self.timeout, args=(roundNum,)).start()
-                return 
+                threading.Thread(target=self.timeout, args=(roundNum,1)).start()
+                return bal
         def check_promise_count(self, roundNum):
             with self.lock:
                 if self.timed_out:
@@ -223,9 +246,9 @@ class Paxos:
 
                 if acceptNum != None:
                     if self.acceptNum == None:
-                        self.acceptNum = acceptNum - 1
+                        self.acceptNum = (acceptNum[0] - 1, self.proc_id)
                     if acceptNum > self.acceptNum:
-                        self.acceptNum = acceptNum
+                        self.acceptNum = (acceptNum[0], self.proc_id)
                         self.acceptVal = acceptVal
                 else:
                     self.received_trans.extend(acceptVal)
@@ -234,19 +257,23 @@ class Paxos:
             Phase 2: Value proposition
         """
         def wait_acceptack(self, ballot, roundNum):
-            if acceptVal == None:
+            if self.acceptVal == None:
                 all_transactions = copy.deepcopy(self.received_trans) + copy.deepcopy(self.my_trans)
                 propose_block = self.bc.create_block(all_transactions, roundNum)
             else:
-                propose_block = acceptVal
+                propose_block = self.acceptVal
+            self.acceptVal = propose_block
+            self.acceptNum = ballot
+            self.num_acceptack = 0
             msg = {
                 'type': 'accept',
                 'acceptVal': propose_block,
                 'acceptNum': ballot,
                 'roundNum': roundNum 
             }
-            threading.Thread(target=self.timeout, args=(roundNum,)).start()
-
+            send_message(self.output_sockets, -1, msg)
+            threading.Thread(target=self.timeout, args=(roundNum,2)).start()
+            return self.acceptVal
         def check_acceptack_count(self, roundNum):
             with self.lock:
                 if self.timed_out:
@@ -255,7 +282,6 @@ class Paxos:
                     return -2
                 else:
                     return self.num_acceptack
-
         def send_acceptack(self, dest_port, ballot, roundNum, proposedValue):
             with self.lock:
                 if roundNum < self.get_round():
@@ -264,27 +290,70 @@ class Paxos:
                 elif roundNum > self.get_round():
                     ask_resync(dest_port)
                     return
-                if ballot > self.ballot:
+                if self.acceptNum == None or self.acceptNum < ballot:
                     self.acceptVal = proposedValue 
                     self.acceptNum = ballot
-                    self.ballot = ballot
                     msg={
                         "type": "acceptack",
                         "ballot": ballot,
                         "roundNum": self.get_round()
                     }
+                    print('sending accept_ack')
                     send_message(self.output_sockets, dest_port, msg)
+                else:
+                    print("Received accept: acceptNum(%s) is stale. Mine is (%s)" % (str(ballot), str(self.ballot)))
 
+        def receive_acceptack(self, source_port, otherRound, acceptNum):
+            with self.lock:
+                if otherRound < self.get_round():
+                    self.send_resync(source_port)
+                    return #Ignore old rounds
+                elif otherRound > self.get_round():
+                    self.ask_resync(source_port)
+                    return
+                if acceptNum != self.acceptNum:
+                    print("Received acceptNum(%d) is stale. Mine is (%d)" % (acceptNum, self.acceptNum))
+                    return
+                self.num_acceptack += 1
+        
+        
+        def send_decide(self, value, roundNum):
+            msg = {
+                "type": "decide",
+                "value": value,
+                "roundNum": roundNum,
+                "tx": None
+            }
+            send_message(self.output_sockets, -1, msg)
+            self.acceptVal = None
+            self.acceptNum = None
+        def receive_decision(self, value, depth):
+            if not self.bc.add(value, depth):
+                print('Already inserted block of depth %d. My depth is %d' % (depth, self.get_round()))
+                return
+            max_seq = -1
+            for tx in value['tx']:
+                if (tx['source'] == self.name and max_seq < tx['seq']):
+                    max_seq = tx['seq']
+            print(max_seq)
+            self.my_trans = [tx for tx in self.my_trans if tx['seq'] > max_seq]
+            self.send_decide(value, depth)
+            return
         def do_resync(self, other_chain):
             with self.lock:
-                if len(other_chain) > self.bc.chain:
-                    self.bc.chain = Blockchain(other_chain)
+                if len(other_chain) > len(self.bc.chain):
+                    self.bc = Blockchain(other_chain)
+                    self.acceptNum = None
+                    self.acceptVal = None
+                    self.timed_out=False
+                    self.ballot = (0,self.proc_id)
         def send_resync(self, dest_port):
             with self.lock:
                 msg = {
                     'type': 'resync',
                     'chain': copy.deepcopy(self.bc.chain)
                 }
+                print('sending resync')
                 send_message(self.output_sockets, dest_port, msg)
         def ask_resync(self, dest_port):
             with self.lock:
@@ -292,15 +361,16 @@ class Paxos:
                     'type': 'resync_request'
                 }
                 send_message(self.output_sockets, dest_port, msg)
-        def timeout(self, roundNum):
+        def timeout(self, roundNum, timeout_phase):
             self.timed_out = False
+            self.timeout_phase  = timeout_phase
             rTime = random.randint(*self.TIMEOUT_IN_SEC)
             print("sleeping for", rTime)
             time.sleep(rTime)
             print("TIME OUT THREAD WOKE UP")
             with self.lock:
                 print("TIME OUT THREAD WOKE UP")
-                if roundNum == self.get_round():
+                if roundNum == self.get_round() and self.timeout_phase == timeout_phase:
                     self.timed_out = True
     instance = None
     def __new__(cls): # __new__ always a classmethod
@@ -334,7 +404,12 @@ def listen_to_socket(socket, port, out_sockets):
     global events
     try:
         while True:
-            raw_data = socket.recv(4096)
+            rl = socket.recv(8)
+            (raw_len,) = unpack('>Q', rl)
+            raw_data = b''
+            while(len(raw_data) < raw_len):
+                to_read = raw_len - len(raw_data)
+                raw_data += socket.recv(4096 if to_read > 4096 else to_read)
             message = pickle.loads(raw_data)
             print("Received the following message:")
             pprint.pprint(message)
@@ -344,22 +419,32 @@ def listen_to_socket(socket, port, out_sockets):
                     events['queue'].append({"source": port, "data" : message})
     except:
         out_sockets.pop(port, None)
+        traceback.print_exc()
         print(port, "disconnected")
     return 0
 def handle_new_connections(socket, outputs):
     while True:
         conn, addr = socket.accept()
         print('Connected by', addr)
-        raw_data = conn.recv(4096)
+        rl = conn.recv(8)
+        (raw_len,) = unpack('>Q', rl)
+        raw_data = b''
+        while(len(raw_data) < raw_len):
+            to_read = raw_len - len(raw_data)
+            raw_data += conn.recv(4096 if to_read > 4096 else to_read)
         message = pickle.loads(raw_data)
+        print('here', message)
         try:
             if(message['type'] != 'greet' or int(message['body']) in outputs.keys()):
-                conn.sendall(pickle.dumps({'type': 'goodbye'}))
+                msg = {'type': 'goodbye'}
+                raw_msg = pickle.dumps(msg)
+                send_bytes(conn, raw_msg)
                 conn.close()
             else:
                 outputs[message['body']] = conn
                 threading.Thread(target=listen_to_socket, args=(conn, message['body'], outputs)).start()
         except:
+            traceback.print_exc()
             outputs.pop(message['body'], None)
             conn.close()
 
@@ -373,7 +458,13 @@ def send_message(output_sockets, dest_port,msg):
         ports_li.append(dest_port)
 
     for port in ports_li:
-        output_sockets[port].sendall(pickle.dumps(msg))
+        raw = pickle.dumps(msg)
+        send_bytes(output_sockets[port], raw)
+
+def send_bytes(sock, msg_raw):
+    length = pack('>Q', len(msg_raw))
+    sock.sendall(length)
+    sock.sendall(msg_raw)
 
 def event_loop(output_sockets):
     global events
@@ -393,7 +484,7 @@ def event_loop(output_sockets):
                 events['parallel_events'].pop(event_i)
 
 
-    Paxos().initialize(output_sockets, from_file_bc,  from_file_trans)
+    Paxos().initialize(output_sockets, from_file_bc,  from_file_trans, 3, client_port_to_name[client_list[my_index]])
     while True:
         time.sleep(1)
         #Get entry if queue is not empty
@@ -464,7 +555,7 @@ def event_loop(output_sockets):
                             events['parallel_events'].append({'data': {'type': 'check_promise_count', 'tx': tx, 'roundNum': roundNum, 'ballot': bal}})
                         else:
                             print('SUCCESS Paxos Phase 1: RECEIVED %d REPLIES' % result)
-                            events['queue'].append({'data': {'type': 'wait_acceptack', 'tx': tx}, 'roundNum': roundNum, 'ballot': bal})
+                            events['queue'].append({'data': {'type': 'wait_acceptack', 'tx': tx, 'roundNum': roundNum, 'ballot': bal}})
                     elif event_type == "prepare":
                         reply_dest = event['source']
                         received_roundNum= event['data']['roundNum']
@@ -485,25 +576,62 @@ def event_loop(output_sockets):
                     elif event_type == "promise":
                         Paxos().receive_promise(event['source'], *decomp(event['data'],['roundNum', 'ballot', 'acceptNum', 'acceptVal']))
                     elif event_type == "accept":
-                        reply_dest = event['source']
-                        Paxos().send_acceptack(reply_dest)
+                        dest_port = event['source']
+                        bal, roundNum, acceptVal = decomp(event['data'], ['acceptNum', 'roundNum', 'acceptVal'])
+                        Paxos().send_acceptack(dest_port, bal, roundNum, acceptVal)
                     elif event_type == "wait_acceptack":
-                        print(event_type, Paxos().received_trans)
-                        Paxos().wait_acceptack()
+                        acceptVal = Paxos().wait_acceptack(event['data']['ballot'], event['data']['roundNum'])
+                        events['parallel_events'].append({
+                            'data': {
+                                'type': 'check_acceptack_count',
+                                'tx': event['data']['tx'],
+                                'acceptVal': acceptVal,
+                                'roundNum': event['data']['roundNum'],
+                                'acceptNum': event['data']['ballot'],
+                            }
+                        })
                     elif event_type == "check_acceptack_count":
-                        pop_current(has_seq_event, event_i, len(randomSample))
-                        continue
-                    elif event_type == "accept_ack":
-                        pop_current(has_seq_event, event_i, len(randomSample))
-                        continue
+                        tx = event['data']['tx']
+                        roundNum = event['data']['roundNum']
+                        bal = event['data']['acceptNum']
+                        value = event['data']['acceptVal']
+                        result = Paxos().check_acceptack_count(roundNum)
+                        if result == -1:
+                            print('Paxos Phase 2: Timeout during value proposal')
+                            ans = input("Do you want to try again? (aka fix nw partition before retrying) (Y/n)?") 
+                            if ans == 'n':
+                                pop_current(has_seq_event, event_i, len(randomSample))
+                                continue 
+                            else:
+                                events['queue'].append({'data': { 'type': 'wait_prepare', 'tx': tx}})
+                        elif result == -2:
+                            print('Paxos Phase 2: I received a decision since starting paxos. Trying again on next round')
+                            events['queue'].append({'data': { 'type': 'wait_prepare', 'tx': tx}})
+                        elif result < Paxos().REPLY_COUNT:
+                            print('Paxos Phase 2: Waiting for enough accept_ack. Currently have %d replies' % result)
+                            events['parallel_events'].append({'data': copy.deepcopy(event['data'])})
+                        else:
+                            print('SUCCESS Paxos Phase 2: RECEIVED %d REPLIES' % result)
+                            events['queue'].append({'data': {'type': 'decide', 'roundNum': roundNum, 'value': value, 'tx': tx}})
+                    elif event_type == "acceptack":
+                        Paxos().receive_acceptack(event['source'], *decomp(event['data'], ['roundNum', 'ballot']))
                     elif event_type == "decide":
-                        received_value = event['data']['block']
-                        Paxos().decide(received_value)
+                        received_value = event['data']['value']
+                        roundNum = event['data']['roundNum']
+                        tr = event['data']['tx']
+                        Paxos().receive_decision(received_value, roundNum)
+                        if tr != None:
+                            if Paxos().is_valid_tx(tr):
+                                Paxos().add_localtx(tr)
+                            else:
+                                print('Invalid transaction', tr)
                     elif event_type == "resync":
                         received_chain = event['data']['chain']
                         Paxos().do_resync(received_chain)
                     elif event_type == "resync_request":
                         Paxos().send_resync(event['source'])
+                    else:
+                        print('\n\nERROR: Received invalid event!!!!!!!!, %s\n\n' % (event_type))
 
                     pop_current(has_seq_event, event_i, len(randomSample))
 
@@ -532,7 +660,9 @@ def transaction_client(host, port):
                     s = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
                     if client_port not in output_sockets.keys():
                         s.connect(('localhost', client_port))
-                        s.sendall(pickle.dumps({'type': 'greet', 'body': port}))
+                        msg={'type': 'greet', 'body': port}
+                        raw = pickle.dumps(msg)
+                        send_bytes(s, raw)
                         output_sockets[client_port] = s
                         print("Successfully connected to ", client_port)
                         threading.Thread(target=listen_to_socket, args=(s, client_port,output_sockets)).start()
